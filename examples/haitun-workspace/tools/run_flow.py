@@ -745,7 +745,10 @@ def _parse_human_response(value: str) -> object:
     try:
         return json.loads(value, parse_constant=_reject_json_constant)
     except (json.JSONDecodeError, ValueError) as error:
-        raise ValueError("human_response_json must be valid JSON") from error
+        stripped = value.strip()
+        if not stripped or stripped[0] in {"{", "[", '"'} or stripped in {"NaN", "Infinity", "-Infinity"}:
+            raise ValueError("human_response_json must be valid JSON or non-empty plain text") from error
+        return value
 
 
 def _json_values_equal(left: object, right: object) -> bool:
@@ -2571,9 +2574,10 @@ async def run_flow_resume(
     Args:
         run_id: Opaque run ID returned by ``run_flow``.
         request_id: Opaque Human request ID returned by the latest wait.
-        human_response_json: The person's response encoded as any valid JSON
-            value. For multiple output artifacts, use an object keyed exactly
-            by those artifact IDs.
+        human_response_json: The person's response as non-empty plain text or
+            encoded as any valid JSON value. JSON-looking text must be encoded
+            as a JSON string to preserve its string type. For multiple output
+            artifacts, use a JSON object keyed exactly by those artifact IDs.
 
     Returns:
         The final output Artifact mapping, or the next
