@@ -2186,16 +2186,6 @@ async def _complete_agent_step(
                     output_ids=context.output_ids,
                 )
             except _AgentStepResultParseError as error:
-                if len(context.output_ids) == 1:
-                    _warn_agent_result_fallback(
-                        step_id=context.step_id,
-                        executor_id=context.executor_id,
-                        output_ids=context.output_ids,
-                        fallback_mode="single_raw",
-                        validation_error=error,
-                        repair_attempts=attempt,
-                    )
-                    return {context.output_ids[0]: response}
                 validation_error = error
             except ValueError as error:
                 validation_error = error
@@ -2217,8 +2207,9 @@ async def _complete_agent_step(
             raise ValueError(f"step {context.step_id!r} result remained invalid after 3 attempts") from validation_error
         message = (
             f"Your previous step result was invalid: {validation_error}\n"
-            "Do not redo the step. Call submit_step_result exactly once and by itself "
-            f"with exactly these keys: {json.dumps(context.output_ids, ensure_ascii=False)}."
+            "Do not redo the step. Return exactly one valid JSON object as ordinary assistant content, "
+            f"keyed by exactly these output keys: {json.dumps(context.output_ids, ensure_ascii=False)}. "
+            "Do not add Markdown or prose."
         )
     raise AssertionError("unreachable")
 
