@@ -23,7 +23,14 @@ _WINDOWS_RESERVED_NAME = re.compile(
 
 
 class ArtifactStore:
-    """Persist each materialized Artifact as one Markdown file."""
+    """Persist user-readable Markdown projections of materialized Artifacts.
+
+    Human workflows keep their resumable source of truth in a private
+    ``ExecutionCheckpoint``. Reopening this store intentionally starts with no
+    remembered IDs so the adapter can republish that checkpoint, repairing
+    missing managed files and replacing manual edits to checkpointed files
+    before execution continues. Unrelated extra files are left untouched.
+    """
 
     def __init__(self, run_dir: anyio.Path, artifacts_dir: anyio.Path) -> None:
         self.run_dir = run_dir
@@ -63,7 +70,7 @@ class ArtifactStore:
         return cls(run_dir, artifacts_dir)
 
     async def persist(self, values: Mapping[str, object]) -> None:
-        """Atomically write every newly materialized Artifact value."""
+        """Atomically write each value not yet published by this store instance."""
 
         written = 0
         for artifact_id in sorted(values):

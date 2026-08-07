@@ -20,6 +20,43 @@ objects, arrays, numbers, booleans, and null are represented by a fenced
 `json` block. This user-visible history is separate from private Human resume
 state under `.psi/fusion-flow/runs/`.
 
+### Artifact persistence and Human resume
+
+Each initial `run_flow` that passes validation and reaches persistence allocates
+a fresh opaque run ID: 32 lowercase hexadecimal characters generated from 16
+random bytes, not a timestamp. The run therefore gets its own
+`runs/<run-id>/artifacts/` directory, giving runtime-managed Artifact Markdown
+run-scoped isolation across normal initial executions.
+
+Runs containing Human Steps use two principal persistence surfaces with
+different roles:
+
+- `ArtifactStore` writes the user-readable Markdown projection under the
+  workflow bundle's `runs/<run-id>/artifacts/` directory.
+- `JobStore` keeps the authoritative resumable values in the private
+  `ExecutionCheckpoint.values` under `.psi/fusion-flow/runs/<run-id>.json`.
+
+This describes authority and purpose, not an exact physical copy count; the
+private run document also records inputs, Human responses, and final outputs as
+part of its state.
+
+`run_flow_resume` continues the original run with the original run ID. It
+restores the private checkpoint, skips completed Steps and selections, and
+then continues the remaining plan. When execution actually resumes, rather
+than returning an already completed result or the current Human request
+idempotently, it republishes the checkpoint values to the same run's Markdown
+projection. This publication does not rerun completed Steps, but it atomically
+replaces the files for checkpointed Artifact IDs: missing files are restored
+and manual edits to those files are discarded. Unrelated extra files are not
+removed. Treat the managed Markdown files as a readable projection, not as
+resume input. Runs without Human Steps have no durable private resume
+checkpoint.
+
+This isolation covers only declarative Artifacts managed by the workflow
+runtime. Agent or Program code that writes an ordinary fixed workspace path,
+database row, or external service must provide its own run scoping or
+idempotency.
+
 ## Workspace integration
 
 Reusable declarations use one fixed bundle under `flows/workflows/<slug>/`.
