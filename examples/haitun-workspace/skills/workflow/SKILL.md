@@ -147,8 +147,9 @@ When `run_flow` or `run_flow_resume` returns a sole top-level `$fusion_flow/cont
 1. Call the existing `clarify` tool with `$fusion_flow/control.request.question`, `.options`, `.recommended`, and `.default`.
 2. Show the formatted text verbatim and **END THE TURN**. Do not call another tool and do not treat the question as an output Artifact.
 3. On the next user message, map a numbered choice to its option label. If the user selected the generated `Other` line without supplying text, ask for that text first. For an open-ended request with a non-empty `default`, map an affirmative acceptance such as “可以” or “ok” to that exact default. Preserve other free text or structured content.
-4. JSON-encode that value and call `run_flow_resume` with the exact `$fusion_flow/control.run_id` and `.request.request_id`.
-5. If another Human request is returned, repeat this protocol. Otherwise report the final output Artifact mapping.
+4. For a single-output Human Step, JSON-encode every mapped option label or default as a JSON string. Pass other ordinary non-empty free text directly, except JSON-encode it as a JSON string when its trimmed spelling is valid JSON, starts with `{`, `[`, or `"`, or equals `NaN`, `Infinity`, or `-Infinity`. JSON-encode non-string structured content. Multiple output Artifacts require a JSON object keyed exactly by those Artifact IDs; JSON-encode that object without dropping or adding keys.
+5. Call `run_flow_resume` with the exact `$fusion_flow/control.run_id` and `.request.request_id`.
+6. If another Human request is returned, repeat this protocol. Otherwise report the final output Artifact mapping.
 
 Never invent, reuse, or guess a run/request ID. A changed workflow source, stale request, or conflicting duplicate response is a stop-and-report error.
 

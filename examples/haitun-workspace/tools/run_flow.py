@@ -22,6 +22,7 @@ from typing import Any, cast
 import anyio
 import anyio.lowlevel
 from anyio.abc import ByteReceiveStream, Process
+from json_repair import repair_json
 from loguru import logger
 
 from psi_agent.session.agent import SessionAgent, current_tool_ai_socket
@@ -664,13 +665,28 @@ def _parse_agent_step_result(
     try:
         result = _parse_strict_agent_mapping(value, label=label)
     except ValueError as error:
-        fenced = _extract_json_fences(value)
-        if len(fenced) != 1:
+        if not isinstance(error.__cause__, json.JSONDecodeError):
             raise _AgentStepResultParseError(str(error)) from error
+        fenced = _extract_json_fences(value)
+        if len(fenced) > 1:
+            raise _AgentStepResultParseError(str(error)) from error
+        repair_source = fenced[0] if fenced else value
         try:
-            result = _parse_strict_agent_mapping(fenced[0], label=label)
-        except ValueError as fenced_error:
-            raise _AgentStepResultParseError(str(fenced_error)) from fenced_error
+            repaired = repair_json(
+                repair_source,
+                ensure_ascii=False,
+                skip_json_loads=True,
+            )
+            if not isinstance(repaired, str):
+                raise ValueError(f"{label} JSON repair did not return text")
+            result = _parse_strict_agent_mapping(repaired, label=label)
+        except (TypeError, ValueError) as repair_error:
+            raise _AgentStepResultParseError(str(repair_error)) from repair_error
+        logger.bind(
+            event="fusion_flow.agent_json_repaired",
+            step_id=step_id,
+            output_artifact_ids=list(output_ids),
+        ).info("FusionFlow Agent Step repaired malformed JSON before model retry")
 
     expected = set(output_ids)
     actual = set(result)
@@ -745,7 +761,10 @@ def _parse_human_response(value: str) -> object:
     try:
         return json.loads(value, parse_constant=_reject_json_constant)
     except (json.JSONDecodeError, ValueError) as error:
-        raise ValueError("human_response_json must be valid JSON") from error
+        stripped = value.strip()
+        if not stripped or stripped[0] in {"{", "[", '"'} or stripped in {"NaN", "Infinity", "-Infinity"}:
+            raise ValueError("human_response_json must be valid JSON or non-empty plain text") from error
+        return value
 
 
 def _json_values_equal(left: object, right: object) -> bool:
@@ -2186,16 +2205,6 @@ async def _complete_agent_step(
                     output_ids=context.output_ids,
                 )
             except _AgentStepResultParseError as error:
-                if len(context.output_ids) == 1:
-                    _warn_agent_result_fallback(
-                        step_id=context.step_id,
-                        executor_id=context.executor_id,
-                        output_ids=context.output_ids,
-                        fallback_mode="single_raw",
-                        validation_error=error,
-                        repair_attempts=attempt,
-                    )
-                    return {context.output_ids[0]: response}
                 validation_error = error
             except ValueError as error:
                 validation_error = error
@@ -2217,8 +2226,9 @@ async def _complete_agent_step(
             raise ValueError(f"step {context.step_id!r} result remained invalid after 3 attempts") from validation_error
         message = (
             f"Your previous step result was invalid: {validation_error}\n"
-            "Do not redo the step. Call submit_step_result exactly once and by itself "
-            f"with exactly these keys: {json.dumps(context.output_ids, ensure_ascii=False)}."
+            "Do not redo the step. Return exactly one valid JSON object as ordinary assistant content, "
+            f"keyed by exactly these output keys: {json.dumps(context.output_ids, ensure_ascii=False)}. "
+            "Do not add Markdown or prose."
         )
     raise AssertionError("unreachable")
 
@@ -2571,9 +2581,10 @@ async def run_flow_resume(
     Args:
         run_id: Opaque run ID returned by ``run_flow``.
         request_id: Opaque Human request ID returned by the latest wait.
-        human_response_json: The person's response encoded as any valid JSON
-            value. For multiple output artifacts, use an object keyed exactly
-            by those artifact IDs.
+        human_response_json: The person's response as non-empty plain text or
+            encoded as any valid JSON value. JSON-looking text must be encoded
+            as a JSON string to preserve its string type. For multiple output
+            artifacts, use a JSON object keyed exactly by those artifact IDs.
 
     Returns:
         The final output Artifact mapping, or the next
