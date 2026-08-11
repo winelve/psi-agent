@@ -57,6 +57,32 @@ runtime. Agent or Program code that writes an ordinary fixed workspace path,
 database row, or external service must provide its own run scoping or
 idempotency.
 
+### Step timing sidecar
+
+The workspace runner records wall-clock timing for every Agent and Program
+Step. Human preparation and Human wait time are deliberately excluded. A
+non-foreach Step contains all retry attempts; a foreach Step contains the
+concurrent group wall time, every iteration, and every attempt within that
+iteration. Attempt time begins after resource admission, while the parent Step
+or iteration includes resource waiting and retry delays. Checkpoint/sidecar I/O
+is excluded. If a foreach Step resumes after recoverable cancellation, its
+execution segments are summed, so Human or suspension time is not counted and
+previously completed iterations remain in the final report.
+
+During a run, every completed non-Human Step atomically updates
+`runs/<run-id>/step-timings.json` with `status: "running"`. The same public file
+is reopened after a Human resume without adding fields to the private
+`ExecutionCheckpoint` or JobStore schema. On completed, failed, or terminally
+cancelled runs, the runner atomically rewrites it with the terminal status.
+Ordinary recoverable cancellation leaves it as `running`. Legacy
+`.step-timings.partial.json` files are loaded once and migrated on the next
+write.
+
+The timing sidecar is not an Artifact, is not passed to an Agent, and is not a
+resume authority. Timing collection and sidecar failures are logged and do not
+change workflow outputs, checkpoint state, retries, or terminal business
+status.
+
 ## Workspace integration
 
 Reusable declarations use one fixed bundle under `flows/workflows/<slug>/`.
