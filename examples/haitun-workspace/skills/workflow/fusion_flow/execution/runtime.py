@@ -78,7 +78,7 @@ def stable_payload_hash(value: object) -> str:
 async def _atomic_write_bytes(path: anyio.Path, value: bytes) -> None:
     """以原子替换方式写入字节。"""
     # 临时文件与目标文件同目录. 确保替换可保持原子性。
-    temporary = anyio.Path(path.parent, f".{path.name}.tmp-{uuid4().hex}")
+    temporary = anyio.Path(path.parent, f".tmp-{uuid4().hex[:16]}")
     try:
         await temporary.write_bytes(value)
         # 完整写入后再原子替换目标文件。
