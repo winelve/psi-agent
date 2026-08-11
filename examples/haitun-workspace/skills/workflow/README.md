@@ -46,7 +46,7 @@ then continues the remaining plan. When execution actually resumes, rather
 than returning an already completed result or the current Human request
 idempotently, it republishes the checkpoint values to the same run's Markdown
 projection. This publication does not rerun completed Steps, but it atomically
-replaces the files for checkpointed Artifact IDs: missing files are restored
+replaces each managed file for checkpointed Artifact IDs: missing files are restored
 and manual edits to those files are discarded. Unrelated extra files are not
 removed. Treat the managed Markdown files as a readable projection, not as
 resume input. Runs without Human Steps have no durable private resume
@@ -181,19 +181,17 @@ inline Instruction text bypasses file resolution.
 
 Each Agent Step receives a `submit_step_result` tool whose schema requires its
 exact output Artifact IDs; a valid submission supplies the Step result, and the
-ephemeral agent turn closes after the current tool-call batch. Plain text remains
-a fallback path only after a normally completed agent turn: the adapter
-accepts one strict JSON object or one standalone, line-delimited `json` fence.
-If parsing still fails and the Step has exactly one output, the original response
-is bound to that Artifact verbatim and a structured warning is emitted without
-logging the response body. Multi-output Steps receive two result-repair turns
-first; if both fail, the first invalid response is broadcast verbatim to every
-declared output and the same warning is emitted. This is deterministic copying,
-not semantic splitting, and is the runtime default rather than an end-user
-option. A zero-output Step may submit an exact empty object, but an invalid
-response still fails after its repair turns because there is nowhere to bind raw
-text. Truncated and tool-round-exhausted turns also fail instead of entering the
-raw-text fallback. No fallback publishes only part of the declared result.
+ephemeral agent turn closes after the current tool-call batch. Final assistant
+text remains a compatibility submission path after a normally completed agent
+turn: the adapter accepts one strict JSON object or one standalone,
+line-delimited `json` fence.
+Malformed JSON is never heuristically repaired because a general repair can
+silently choose, invent, or discard values. Instead, an invalid response receives
+up to two result-retry turns after the initial attempt. If all three attempts fail,
+the Step fails without publishing a value, regardless of its output cardinality.
+A zero-output Step may submit an exact empty object. Truncated and
+tool-round-exhausted turns fail as well. The adapter never binds or broadcasts an
+invalid raw response as an Artifact.
 
 A Program executor must have exactly one `program_path(program) == path`
 declaration. Absolute and explicit `./...` paths pass through; other path

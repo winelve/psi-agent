@@ -22,7 +22,6 @@ from typing import Any, cast
 import anyio
 import anyio.lowlevel
 from anyio.abc import ByteReceiveStream, Process
-from json_repair import repair_json
 from loguru import logger
 
 from psi_agent.session.agent import SessionAgent, current_tool_ai_socket
@@ -607,52 +606,58 @@ def _parse_mapping(value: str, *, label: str) -> dict[str, object]:
     return cast(dict[str, object], parsed)
 
 
-def _parse_strict_agent_mapping(value: str, *, label: str) -> dict[str, object]:
-    def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
-        result: dict[str, object] = {}
-        for key, item in pairs:
-            if key in result:
-                raise ValueError(f"duplicate JSON object key {key!r}")
-            result[key] = item
-        return result
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, item in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object key {key!r}")
+        result[key] = item
+    return result
 
-    try:
-        parsed = json.loads(
-            value,
-            parse_constant=_reject_json_constant,
-            object_pairs_hook=reject_duplicate_keys,
-        )
-        json.dumps(parsed, allow_nan=False)
-    except (json.JSONDecodeError, OverflowError, ValueError) as error:
-        raise ValueError(f"{label} must be a strict JSON object") from error
-    if not isinstance(parsed, dict):
-        raise ValueError(f"{label} must be a strict JSON object")
+
+def _parse_strict_json_value(value: str) -> object:
+    parsed = json.loads(
+        value,
+        object_pairs_hook=_reject_duplicate_json_keys,
+    )
+    json.dumps(parsed, allow_nan=False)
     return parsed
 
 
-def _extract_json_fences(value: str) -> list[str]:
-    lines = value.splitlines(keepends=True)
-    fenced: list[str] = []
-    index = 0
-    while index < len(lines):
-        opener = _JSON_FENCE_OPEN.fullmatch(lines[index].rstrip("\r\n"))
-        if opener is None:
-            index += 1
-            continue
+def _parse_strict_agent_mapping(value: str, *, label: str) -> dict[str, object]:
 
-        opening_width = len(opener.group("fence"))
-        body_start = index + 1
-        index = body_start
-        while index < len(lines):
-            closer = _JSON_FENCE_CLOSE.fullmatch(lines[index].rstrip("\r\n"))
-            if closer is not None and len(closer.group("fence")) >= opening_width:
-                fenced.append("".join(lines[body_start:index]))
-                index += 1
-                break
-            index += 1
-        else:
-            return []
-    return fenced
+    try:
+        parsed = _parse_strict_json_value(value)
+    except (json.JSONDecodeError, OverflowError, RecursionError, ValueError) as error:
+        raise ValueError(f"{label} must be a strict JSON object") from error
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{label} must be a strict JSON object")
+    return cast(dict[str, object], parsed)
+
+
+def _extract_single_json_fence(value: str) -> str | None:
+    lines = value.splitlines(keepends=True)
+    index = 0
+    while index < len(lines) and not lines[index].strip():
+        index += 1
+    if index == len(lines):
+        return None
+
+    opener = _JSON_FENCE_OPEN.fullmatch(lines[index].rstrip("\r\n"))
+    if opener is None:
+        return None
+
+    opening_width = len(opener.group("fence"))
+    body_start = index + 1
+    index = body_start
+    while index < len(lines):
+        closer = _JSON_FENCE_CLOSE.fullmatch(lines[index].rstrip("\r\n"))
+        if closer is not None and len(closer.group("fence")) >= opening_width:
+            if any(line.strip() for line in lines[index + 1 :]):
+                return None
+            return "".join(lines[body_start:index])
+        index += 1
+    return None
 
 
 def _parse_agent_step_result(
@@ -667,26 +672,13 @@ def _parse_agent_step_result(
     except ValueError as error:
         if not isinstance(error.__cause__, json.JSONDecodeError):
             raise _AgentStepResultParseError(str(error)) from error
-        fenced = _extract_json_fences(value)
-        if len(fenced) > 1:
+        fenced = _extract_single_json_fence(value)
+        if fenced is None:
             raise _AgentStepResultParseError(str(error)) from error
-        repair_source = fenced[0] if fenced else value
         try:
-            repaired = repair_json(
-                repair_source,
-                ensure_ascii=False,
-                skip_json_loads=True,
-            )
-            if not isinstance(repaired, str):
-                raise ValueError(f"{label} JSON repair did not return text")
-            result = _parse_strict_agent_mapping(repaired, label=label)
-        except (TypeError, ValueError) as repair_error:
-            raise _AgentStepResultParseError(str(repair_error)) from repair_error
-        logger.bind(
-            event="fusion_flow.agent_json_repaired",
-            step_id=step_id,
-            output_artifact_ids=list(output_ids),
-        ).info("FusionFlow Agent Step repaired malformed JSON before model retry")
+            result = _parse_strict_agent_mapping(fenced, label=label)
+        except ValueError as fenced_error:
+            raise _AgentStepResultParseError(str(fenced_error)) from fenced_error
 
     expected = set(output_ids)
     actual = set(result)
@@ -695,29 +687,6 @@ def _parse_agent_step_result(
             f"outputs for {step_id!r} must match exactly: expected {sorted(expected)}, got {sorted(actual)}"
         )
     return result
-
-
-def _warn_agent_result_fallback(
-    *,
-    step_id: str,
-    executor_id: str,
-    output_ids: tuple[str, ...],
-    fallback_mode: str,
-    validation_error: ValueError,
-    repair_attempts: int,
-) -> None:
-    validation_failure = (
-        "unparseable_result" if isinstance(validation_error, _AgentStepResultParseError) else "output_keys_mismatch"
-    )
-    logger.bind(
-        event="fusion_flow.agent_result_fallback",
-        step_id=step_id,
-        executor_id=executor_id,
-        output_artifact_ids=list(output_ids),
-        fallback_mode=fallback_mode,
-        validation_failure=validation_failure,
-        repair_attempts=repair_attempts,
-    ).warning("FusionFlow Agent Step committed a raw-response fallback")
 
 
 def _parse_resource_capacities(value: str) -> Mapping[str, ResourceCapacity] | None:
@@ -759,12 +728,18 @@ def _bind_step_tool_to_workspace(
 
 def _parse_human_response(value: str) -> object:
     try:
-        return json.loads(value, parse_constant=_reject_json_constant)
-    except (json.JSONDecodeError, ValueError) as error:
+        parsed = _parse_strict_json_value(value)
+    except json.JSONDecodeError as error:
         stripped = value.strip()
-        if not stripped or stripped[0] in {"{", "[", '"'} or stripped in {"NaN", "Infinity", "-Infinity"}:
+        spelling = stripped
+        while spelling.startswith("\ufeff"):
+            spelling = spelling[1:].lstrip()
+        if not spelling or spelling[0] in {"{", "[", '"'} or spelling in {"NaN", "Infinity", "-Infinity"}:
             raise ValueError("human_response_json must be valid JSON or non-empty plain text") from error
         return value
+    except (OverflowError, RecursionError, ValueError) as error:
+        raise ValueError("human_response_json must be valid JSON or non-empty plain text") from error
+    return parsed
 
 
 def _json_values_equal(left: object, right: object) -> bool:
@@ -2164,8 +2139,6 @@ async def _complete_agent_step(
         "If tool calling is unavailable, respond with exactly one JSON object keyed by exactly "
         "those output keys, with no surrounding prose or Markdown."
     )
-    first_invalid_response: str | None = None
-    first_validation_error: ValueError | None = None
 
     def stop_after_submission() -> bool:
         nonlocal submission_error
@@ -2208,21 +2181,7 @@ async def _complete_agent_step(
                 validation_error = error
             except ValueError as error:
                 validation_error = error
-            if first_invalid_response is None:
-                first_invalid_response = response
-                first_validation_error = validation_error
         if attempt == 2:
-            if len(context.output_ids) > 1 and first_invalid_response is not None:
-                assert first_validation_error is not None
-                _warn_agent_result_fallback(
-                    step_id=context.step_id,
-                    executor_id=context.executor_id,
-                    output_ids=context.output_ids,
-                    fallback_mode="broadcast_raw",
-                    validation_error=first_validation_error,
-                    repair_attempts=attempt,
-                )
-                return dict.fromkeys(context.output_ids, first_invalid_response)
             raise ValueError(f"step {context.step_id!r} result remained invalid after 3 attempts") from validation_error
         message = (
             f"Your previous step result was invalid: {validation_error}\n"
