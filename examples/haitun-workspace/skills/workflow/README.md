@@ -20,6 +20,43 @@ objects, arrays, numbers, booleans, and null are represented by a fenced
 `json` block. This user-visible history is separate from private Human resume
 state under `.psi/fusion-flow/runs/`.
 
+### Artifact persistence and Human resume
+
+Each initial `run_flow` that passes validation and reaches persistence allocates
+a fresh opaque run ID: 32 lowercase hexadecimal characters generated from 16
+random bytes, not a timestamp. The run therefore gets its own
+`runs/<run-id>/artifacts/` directory, giving runtime-managed Artifact Markdown
+run-scoped isolation across normal initial executions.
+
+Runs containing Human Steps use two principal persistence surfaces with
+different roles:
+
+- `ArtifactStore` writes the user-readable Markdown projection under the
+  workflow bundle's `runs/<run-id>/artifacts/` directory.
+- `JobStore` keeps the authoritative resumable values in the private
+  `ExecutionCheckpoint.values` under `.psi/fusion-flow/runs/<run-id>.json`.
+
+This describes authority and purpose, not an exact physical copy count; the
+private run document also records inputs, Human responses, and final outputs as
+part of its state.
+
+`run_flow_resume` continues the original run with the original run ID. It
+restores the private checkpoint, skips completed Steps and selections, and
+then continues the remaining plan. When execution actually resumes, rather
+than returning an already completed result or the current Human request
+idempotently, it republishes the checkpoint values to the same run's Markdown
+projection. This publication does not rerun completed Steps, but it atomically
+replaces each managed file for checkpointed Artifact IDs: missing files are restored
+and manual edits to those files are discarded. Unrelated extra files are not
+removed. Treat the managed Markdown files as a readable projection, not as
+resume input. Runs without Human Steps have no durable private resume
+checkpoint.
+
+This isolation covers only declarative Artifacts managed by the workflow
+runtime. Agent or Program code that writes an ordinary fixed workspace path,
+database row, or external service must provide its own run scoping or
+idempotency.
+
 ## Workspace integration
 
 Reusable declarations use one fixed bundle under `flows/workflows/<slug>/`.
@@ -144,19 +181,17 @@ inline Instruction text bypasses file resolution.
 
 Each Agent Step receives a `submit_step_result` tool whose schema requires its
 exact output Artifact IDs; a valid submission supplies the Step result, and the
-ephemeral agent turn closes after the current tool-call batch. Plain text remains
-a fallback path only after a normally completed agent turn: the adapter
-accepts one strict JSON object or one standalone, line-delimited `json` fence.
-If parsing still fails and the Step has exactly one output, the original response
-is bound to that Artifact verbatim and a structured warning is emitted without
-logging the response body. Multi-output Steps receive two result-repair turns
-first; if both fail, the first invalid response is broadcast verbatim to every
-declared output and the same warning is emitted. This is deterministic copying,
-not semantic splitting, and is the runtime default rather than an end-user
-option. A zero-output Step may submit an exact empty object, but an invalid
-response still fails after its repair turns because there is nowhere to bind raw
-text. Truncated and tool-round-exhausted turns also fail instead of entering the
-raw-text fallback. No fallback publishes only part of the declared result.
+ephemeral agent turn closes after the current tool-call batch. Final assistant
+text remains a compatibility submission path after a normally completed agent
+turn: the adapter accepts one strict JSON object or one standalone,
+line-delimited `json` fence.
+Malformed JSON is never heuristically repaired because a general repair can
+silently choose, invent, or discard values. Instead, an invalid response receives
+up to two result-retry turns after the initial attempt. If all three attempts fail,
+the Step fails without publishing a value, regardless of its output cardinality.
+A zero-output Step may submit an exact empty object. Truncated and
+tool-round-exhausted turns fail as well. The adapter never binds or broadcasts an
+invalid raw response as an Artifact.
 
 A Program executor must have exactly one `program_path(program) == path`
 declaration. Absolute and explicit `./...` paths pass through; other path
