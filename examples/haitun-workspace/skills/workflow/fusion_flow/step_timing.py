@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import math
-import secrets
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
@@ -13,6 +12,8 @@ from typing import Literal, cast
 
 import anyio
 from loguru import logger
+
+from ._atomic_io import atomic_write_text
 
 type TimingStatus = Literal["ok", "error", "cancelled"]
 type ExecutorKind = Literal["Agent", "Program"]
@@ -423,14 +424,7 @@ async def _atomic_write_json(path: anyio.Path, payload: Mapping[str, object]) ->
         indent=2,
         sort_keys=True,
     )
-    temporary = path.parent / f".{path.name}.{secrets.token_hex(8)}.tmp"
-    try:
-        await temporary.write_text(f"{encoded}\n", encoding="utf-8", newline="")
-        await temporary.replace(path)
-    finally:
-        with anyio.CancelScope(shield=True):
-            with suppress(FileNotFoundError):
-                await temporary.unlink()
+    await atomic_write_text(path, f"{encoded}\n", newline="")
 
 
 def _load_payload(source: str) -> dict[str, object]:

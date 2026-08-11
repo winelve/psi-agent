@@ -2267,7 +2267,6 @@ async def _execute_persisted_run(
     *,
     ai_socket: str,
     instruction_files: Mapping[str, str],
-    workflow_id: str,
 ) -> str:
     if run.prepared_request is not None:
         raise ValueError("a Human response must be checkpointed before execution resumes")
@@ -2282,7 +2281,7 @@ async def _execute_persisted_run(
     timing_reporter = await StepTimingReporter.open(
         artifact_store.run_dir,
         run_id=run.run_id,
-        workflow_id=workflow_id,
+        workflow_id=run.checkpoint.workflow_id,
         flow_path=run.flow_path,
     )
     await artifact_store.persist(run.checkpoint.values)
@@ -2503,7 +2502,6 @@ async def run_flow(
                 lease,
                 ai_socket=ai_socket,
                 instruction_files=instruction_files,
-                workflow_id=compiled.graph.workflow_id,
             )
 
     step_tools: ToolRegistry | None = None
@@ -2670,7 +2668,6 @@ async def run_flow_resume(
                 lease,
                 ai_socket=ai_socket,
                 instruction_files=instruction_files,
-                workflow_id=compiled.graph.workflow_id,
             )
 
         if request_id in run.human_responses:
@@ -2715,5 +2712,4 @@ async def run_flow_resume(
             lease,
             ai_socket=ai_socket,
             instruction_files=instruction_files,
-            workflow_id=compiled.graph.workflow_id,
         )
