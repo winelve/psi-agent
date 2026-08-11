@@ -49,6 +49,12 @@ checkpoint + `run_flow_resume` 处理 Human 的跨回合等待。不含 Human St
 runner 注入的受限能力，外层 Session 仍须先收集完整的输入 Artifact。旧 Node/Fuclaw
 runtime 位于 `fusion-flow-legacy`，只处理显式 `.flow.ts` 兼容请求。
 
+**为什么 Agent Step 不自动修复畸形 JSON？**
+Agent 的文本输出只接受一个严格 JSON object，或一个独立、严格解析的 `json` fence。
+通用 JSON repair 会在缺值、重复键、相邻值等输入上补造或丢弃语义，因此畸形内容必须
+进入一次初始尝试加最多两次模型返修。三次尝试仍失败时，不论输出数量，Step 都失败且
+不发布任何值；无效原文不会被绑定或广播为 Artifact。
+
 ## 技术栈
 
 | 领域 | 技术 |
