@@ -7,15 +7,18 @@ import heapq
 import json
 import math
 import operator
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import cast
 
 import anyio
 from loguru import logger
 
 from .execution.flow import _retry_operation, _run_parallel_tasks
+from .step_timing import AttemptTiming, IterationTiming, StepTiming, StepTimingMetadata, TimingStatus
 from .workflow_graph import (
     ArtifactOperand,
     ComparisonCondition,
@@ -647,6 +650,8 @@ async def execute_plan(
     allocator: ResourceAllocator | None = None,
     checkpoint: ExecutionCheckpoint | None = None,
     checkpoint_observer: CheckpointObserver | None = None,
+    timing_recorder: Callable[[StepTiming], None] | None = None,
+    timing_metadata: Mapping[str, StepTimingMetadata] | None = None,
 ) -> dict[str, object]:
     """Start or resume all fibers and interpret their awaits and invocations."""
 
@@ -664,6 +669,14 @@ async def execute_plan(
         )
 
     steps = {step.step_id: step for step in graph.steps}
+    if (timing_recorder is None) != (timing_metadata is None):
+        raise ExecutionPlanError("timing_recorder and timing_metadata must be provided together")
+    timing_by_step = dict(timing_metadata or {})
+    unknown_timed_steps = timing_by_step.keys() - steps.keys()
+    if unknown_timed_steps:
+        raise ExecutionPlanError(f"timing metadata contains unknown steps: {sorted(unknown_timed_steps)}")
+    if not all(isinstance(metadata, StepTimingMetadata) for metadata in timing_by_step.values()):
+        raise ExecutionPlanError("timing_metadata values must be StepTimingMetadata")
     selectors = {selector.output_artifact_id: selector for selector in graph.selectors}
     consumed = {step_id: [] for step_id in steps}
     produced = {step_id: [] for step_id in steps}
@@ -971,6 +984,7 @@ async def execute_plan(
         step_inputs: Mapping[str, object],
         *,
         iteration_index: int | None = None,
+        attempt_timings: list[AttemptTiming] | None = None,
     ) -> tuple[dict[str, object], int]:
         """Invoke and validate one logical StepInstance with per-attempt leases."""
 
@@ -1004,22 +1018,50 @@ async def execute_plan(
                     if iteration_index is not None
                     else step_inputs
                 )
-                if step.timeout_seconds is None:
-                    outputs = await call_dispatcher(
-                        context,
-                        attempt_inputs,
-                    )
-                else:
-                    with anyio.fail_after(step.timeout_seconds):
+                started_at = _timing_now()
+                started = time.perf_counter()
+                try:
+                    if step.timeout_seconds is None:
                         outputs = await call_dispatcher(
                             context,
                             attempt_inputs,
                         )
-                return _validate_step_outputs(
-                    step.step_id,
-                    outputs,
-                    expected_output_ids=produced[step.step_id],
-                )
+                    else:
+                        with anyio.fail_after(step.timeout_seconds):
+                            outputs = await call_dispatcher(
+                                context,
+                                attempt_inputs,
+                            )
+                    validated = _validate_step_outputs(
+                        step.step_id,
+                        outputs,
+                        expected_output_ids=produced[step.step_id],
+                    )
+                except BaseException as error:
+                    if attempt_timings is not None:
+                        status = _timing_status(error)
+                        attempt_timings.append(
+                            AttemptTiming(
+                                attempt=attempt,
+                                started_at=started_at,
+                                finished_at=_timing_now(),
+                                duration_ms=(time.perf_counter() - started) * 1_000,
+                                status=status,
+                                error_type=type(error).__name__,
+                            )
+                        )
+                    raise
+                if attempt_timings is not None:
+                    attempt_timings.append(
+                        AttemptTiming(
+                            attempt=attempt,
+                            started_at=started_at,
+                            finished_at=_timing_now(),
+                            duration_ms=(time.perf_counter() - started) * 1_000,
+                            status="ok",
+                        )
+                    )
+                return validated
 
         def should_retry(error: Exception, attempt: int) -> bool:
             """Retry ordinary executor/output failures, never graph control."""
@@ -1092,7 +1134,12 @@ async def execute_plan(
             foreach_iterations[identity] = iteration
             await observe_checkpoint()
 
-    async def invoke_foreach_step(step: StepNode) -> dict[str, object]:
+    async def invoke_foreach_step(
+        step: StepNode,
+        *,
+        iteration_timings: dict[int, IterationTiming] | None = None,
+        iteration_finished: dict[int, float] | None = None,
+    ) -> dict[str, object]:
         """Expand, execute, and deterministically collect one foreach step."""
 
         edge = foreach_by_step[step.step_id]
@@ -1127,6 +1174,9 @@ async def execute_plan(
         ) -> ForeachIterationCheckpoint:
             """Execute and checkpoint one expanded StepInstance."""
 
+            started_at = _timing_now()
+            started = time.perf_counter()
+            attempt_timings: list[AttemptTiming] | None = [] if iteration_timings is not None else None
             try:
                 step_inputs = {artifact_id: values[artifact_id] for artifact_id in consumed[step.step_id]}
             except KeyError as error:
@@ -1143,9 +1193,24 @@ async def execute_plan(
                     step,
                     step_inputs,
                     iteration_index=iteration_index,
+                    attempt_timings=attempt_timings,
                 )
-            except Exception as error:
-                if not _is_ordinary_step_error(error):
+            except BaseException as error:
+                if not isinstance(error, Exception) or not _is_ordinary_step_error(error):
+                    if iteration_timings is not None:
+                        finished_at = _timing_now()
+                        finished = time.perf_counter()
+                        iteration_timings[iteration_index] = IterationTiming(
+                            iteration_index=iteration_index,
+                            started_at=started_at,
+                            finished_at=finished_at,
+                            duration_ms=(finished - started) * 1_000,
+                            status=_timing_status(error),
+                            error_type=type(error).__name__,
+                            attempts=tuple(attempt_timings or ()),
+                        )
+                        if iteration_finished is not None:
+                            iteration_finished[iteration_index] = finished
                     raise
                 iteration_failures[iteration_index] = error
                 iteration = _failed_iteration(
@@ -1161,6 +1226,21 @@ async def execute_plan(
                     attempts=attempts,
                     outputs=outputs,
                 )
+            if iteration_timings is not None:
+                failure = iteration_failures.get(iteration_index)
+                finished_at = _timing_now()
+                finished = time.perf_counter()
+                iteration_timings[iteration_index] = IterationTiming(
+                    iteration_index=iteration_index,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    duration_ms=(finished - started) * 1_000,
+                    status="error" if failure is not None else "ok",
+                    error_type=type(failure).__name__ if failure is not None else None,
+                    attempts=tuple(attempt_timings or ()),
+                )
+                if iteration_finished is not None:
+                    iteration_finished[iteration_index] = finished
             await commit_iteration(iteration)
             return iteration
 
@@ -1220,12 +1300,83 @@ async def execute_plan(
                 step = steps.get(instruction.step_id)
                 if step is None:
                     raise ExecutionPlanError(f"plan invokes unknown step: {instruction.step_id}")
-                if step.step_id in foreach_by_step:
-                    outputs = await invoke_foreach_step(step)
-                else:
-                    step_inputs = {artifact_id: values[artifact_id] for artifact_id in consumed[step.step_id]}
-                    outputs, _ = await invoke_step(step, step_inputs)
+                metadata = timing_by_step.get(step.step_id)
+                attempt_timings: list[AttemptTiming] | None = [] if metadata is not None else None
+                iteration_timings: dict[int, IterationTiming] | None = {} if metadata is not None else None
+                iteration_finished: dict[int, float] | None = {} if metadata is not None else None
+                started_at = _timing_now()
+                started = time.perf_counter()
+                is_foreach = step.step_id in foreach_by_step
+                try:
+                    if is_foreach:
+                        outputs = await invoke_foreach_step(
+                            step,
+                            iteration_timings=iteration_timings,
+                            iteration_finished=iteration_finished,
+                        )
+                    else:
+                        step_inputs = {artifact_id: values[artifact_id] for artifact_id in consumed[step.step_id]}
+                        outputs, _ = await invoke_step(
+                            step,
+                            step_inputs,
+                            attempt_timings=attempt_timings,
+                        )
+                except BaseException as error:
+                    if metadata is not None:
+                        finished_at, finished = _step_timing_end(
+                            is_foreach=is_foreach,
+                            iteration_timings=iteration_timings,
+                            iteration_finished=iteration_finished,
+                        )
+                        _record_timing(
+                            timing_recorder,
+                            StepTiming(
+                                step_id=step.step_id,
+                                step_name=metadata.step_name,
+                                executor_id=metadata.executor_id,
+                                executor_kind=metadata.executor_kind,
+                                foreach=is_foreach,
+                                started_at=started_at,
+                                finished_at=finished_at,
+                                duration_ms=(finished - started) * 1_000,
+                                status=_timing_status(error),
+                                error_type=type(error).__name__,
+                                attempts=tuple(attempt_timings or ()) if not is_foreach else (),
+                                iterations=(
+                                    tuple(iteration_timings.values())
+                                    if is_foreach and iteration_timings is not None
+                                    else ()
+                                ),
+                            ),
+                        )
+                    raise
 
+                if metadata is not None:
+                    finished_at, finished = _step_timing_end(
+                        is_foreach=is_foreach,
+                        iteration_timings=iteration_timings,
+                        iteration_finished=iteration_finished,
+                    )
+                    _record_timing(
+                        timing_recorder,
+                        StepTiming(
+                            step_id=step.step_id,
+                            step_name=metadata.step_name,
+                            executor_id=metadata.executor_id,
+                            executor_kind=metadata.executor_kind,
+                            foreach=is_foreach,
+                            started_at=started_at,
+                            finished_at=finished_at,
+                            duration_ms=(finished - started) * 1_000,
+                            status="ok",
+                            attempts=tuple(attempt_timings or ()) if not is_foreach else (),
+                            iterations=(
+                                tuple(iteration_timings.values())
+                                if is_foreach and iteration_timings is not None
+                                else ()
+                            ),
+                        ),
+                    )
                 await commit_step_outputs(step.step_id, outputs)
                 completed_steps[step.step_id].set()
                 logger.debug(f"Completed workflow step: {step.step_id}")
@@ -1275,6 +1426,46 @@ async def execute_plan(
             await run_fibers()
 
     return {artifact.artifact_id: values[artifact.artifact_id] for artifact in graph.artifacts if artifact.is_output}
+
+
+def _timing_now() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _step_timing_end(
+    *,
+    is_foreach: bool,
+    iteration_timings: Mapping[int, IterationTiming] | None,
+    iteration_finished: Mapping[int, float] | None,
+) -> tuple[str, float]:
+    if is_foreach and iteration_timings and iteration_finished:
+        return (
+            max(item.finished_at for item in iteration_timings.values()),
+            max(iteration_finished.values()),
+        )
+    return _timing_now(), time.perf_counter()
+
+
+def _timing_status(error: BaseException) -> TimingStatus:
+    if isinstance(error, anyio.get_cancelled_exc_class()):
+        return "cancelled"
+    if isinstance(error, BaseExceptionGroup) and all(
+        _timing_status(nested) == "cancelled" for nested in error.exceptions
+    ):
+        return "cancelled"
+    return "error"
+
+
+def _record_timing(
+    recorder: Callable[[StepTiming], None] | None,
+    record: StepTiming,
+) -> None:
+    if recorder is None:
+        return
+    try:
+        recorder(record)
+    except Exception as error:
+        logger.warning(f"Workflow timing recorder ignored {type(error).__name__}: {error}")
 
 
 def _validate_step_outputs(
